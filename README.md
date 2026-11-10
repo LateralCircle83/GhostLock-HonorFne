@@ -22,7 +22,7 @@ GhostLock-HonorFne/
 
 ### 前置条件
 
-- **设备**：荣耀 70/60/60Pro（FNE/LSA/TNA），系统版本8.0.221/224，内核 5.4.289-qgki-gf6cb1f712a6e/5.4.295-qgki-g0fb2656b2b50|
+- **设备**：荣耀 70/60/60Pro（FNE/LSA/TNA），系统版本 8.0.0.202 / 8.0.221 / 8.0.224，内核 `5.4.289-qgki-gc5b795a0f72f`（8.0.0.202，适配记录见 [docs/FNE-AN00-8.0.0.202.md](docs/FNE-AN00-8.0.0.202.md)）/ `5.4.289-qgki-gf6cb1f712a6e` / `5.4.295-qgki-g0fb2656b2b50`
 - **主机**：macOS 或 Windows，需安装 [Platform-tools](https://developer.android.com/tools/releases/platform-tools) 和 [Git for Windows](https://git-scm.com/download/win) 
 
 ### 一键脚本（Windows / macOS）
