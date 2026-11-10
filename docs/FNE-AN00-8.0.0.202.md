@@ -124,6 +124,10 @@ ksud 3.3.0 (uapi: 2)；管理器 KernelSU v3.3.0 (32601) 显示「工作中 [越
 `batch = 400 : 200`），fork 风暴让内核触发保护性重启——实测两次都在
 `wave 4/5 … forked 400, killing` 之后 panic。**固定 1 次**是这台机器验证过的配方。
 
+`root/host-scripts/run_w2.sh` 已经内置这条规则：部署时先 `adb shell uname -r`，
+命中 `gc5b795a0f72f` 就把 `GL_W1_ATTEMPTS` 默认取 1（显式给环境变量仍可覆盖）。
+所以走 `run_root.bat` 时不需要手工设置。
+
 因此完整的冷启动命令是：
 
 ```bash

@@ -39,7 +39,17 @@ ksu_loaded() {
 }
 
 E="/data/local/tmp/e"
-SYNC="GL_AIM_DM=1 GL_W1_ATTEMPTS=2 GL_ROUTE_ATTEMPTS=1 GL_HOLD_CHAIN=1 GL_HOLD_WAITER=1 GL_PUNCH_IN_WINDOW=1 GL_PUNCH_DELAY_USEC=0 GL_MCAST_ROUTE=1 GL_PROBE_BOOTID=0 GL_SPRAY_TEST=0 GL_STAMP_SYNC=1"
+# 8.0.0.202（5.4.289-qgki-gc5b795a0f72f）：第二次 W1 会重跑 slab_drain，fork 风暴
+# 触发内核保护性重启（2026-11-10 真机两次复现）。该内核默认只跑 1 次，
+# 需要复现时显式 `GL_W1_ATTEMPTS=2 run_w2.sh`。
+KREL=$($T30 adb shell uname -r 2>/dev/null | tr -d '\r')
+W1_ATTEMPTS=${GL_W1_ATTEMPTS:-2}
+case "$KREL" in
+  *gc5b795a0f72f*)
+    if [ -z "${GL_W1_ATTEMPTS:-}" ]; then W1_ATTEMPTS=1; fi ;;
+esac
+[ -n "$KREL" ] && echo "[*] kernel: $KREL (GL_W1_ATTEMPTS=$W1_ATTEMPTS)"
+SYNC="GL_AIM_DM=1 GL_W1_ATTEMPTS=$W1_ATTEMPTS GL_ROUTE_ATTEMPTS=1 GL_HOLD_CHAIN=1 GL_HOLD_WAITER=1 GL_PUNCH_IN_WINDOW=1 GL_PUNCH_DELAY_USEC=0 GL_MCAST_ROUTE=1 GL_PROBE_BOOTID=0 GL_SPRAY_TEST=0 GL_STAMP_SYNC=1"
 
 run_to() { # $1=secs $2=logfile $3...=command
   # 实时显示：子进程输出直接写日志文件，本函数按行号增量读取回显。
