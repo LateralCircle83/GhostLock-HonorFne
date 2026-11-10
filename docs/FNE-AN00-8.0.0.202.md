@@ -95,6 +95,14 @@ python tools/fne202/patch_table.py \
 221104 bytes  sha256 fa1f494ead1000d59a8f5c44714da7cf64c422b0d1d26313977f51e0668976c5
 ```
 
+这个产物已随分支提交为 `root/exploit/ghostlock.fne202`。`run_root.bat` 部署时会先
+`adb shell uname -r`：命中 `gc5b795a0f72f` 就推 202 版，其余内核（221 / 224）继续用
+原版 `root/exploit/ghostlock`。所以这台机器既不需要 NDK，也不用手工替换文件——直接
+跑 `run_root.bat` 就行。
+
+若之后改了 `offsets.h`，用上面的命令重新生成并覆盖 `ghostlock.fne202`，再核对
+`changed 16 symbol slots` 与 sha256 是否与记录一致。
+
 ## 6. 真机结果（2026-11-10）
 
 ```
@@ -140,6 +148,7 @@ adb shell 'nohup env GL_W2_ROUNDS=2 GL_W2_CRED_ADJ=0 /data/local/tmp/e202 > /dat
 | 路径 | 说明 |
 |---|---|
 | `root/exploit/src/devices/fne/offsets.h` | 新增 `5.4.289-qgki-gc5b795a0f72f` 条目 |
+| `root/exploit/ghostlock.fne202` | 打上 202 偏移表的预编译 exploit（`run_root.bat` 按内核自动选用） |
 | `tools/fne202/extract_kernel.py` | boot.img → 裸 ARM64 Image |
 | `tools/fne202/cmp_offsets.py` | 两个内核的符号偏移逐字段对比 |
 | `tools/fne202/verify_entry.py` | offsets.h 条目 ↔ 真实 kallsyms 复核 |

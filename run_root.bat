@@ -114,8 +114,22 @@ for %%F in (chain_hook.sh kernelsu.ko ksud magiskpolicy ksu_rules load_ko kmsg_d
     )
 )
 echo [4/5] Deploying device-side files (~20MB, overwrite sync, please wait)...
+
+rem ---- pick the exploit binary that matches the running kernel ----
+rem 8.0.0.202 (5.4.289-qgki-gc5b795a0f72f) needs its own offset table, shipped
+rem as ghostlock.fne202; all other supported kernels use the stock binary.
+set "EXPLOIT_BIN=root/exploit/ghostlock"
+set "KREL="
+for /f "usebackq delims=" %%K in (`adb shell uname -r 2^>nul`) do if not defined KREL set "KREL=%%K"
+if defined KREL echo       kernel: %KREL%
+set "KREL202="
+if defined KREL echo %KREL%|findstr /c:"gc5b795a0f72f" >nul && set "KREL202=1"
+if defined KREL202 if exist "root\exploit\ghostlock.fne202" set "EXPLOIT_BIN=root/exploit/ghostlock.fne202"
+if defined KREL202 if not exist "root\exploit\ghostlock.fne202" echo [WARN] 8.0.0.202 kernel but root\exploit\ghostlock.fne202 is missing - offsets will not match.
+if defined KREL202 echo       8.0.0.202 kernel - using ghostlock.fne202
+
 adb shell "mkdir -p /data/local/tmp/ksu_fne"
-adb push "root/exploit/ghostlock" /data/local/tmp/e
+adb push "%EXPLOIT_BIN%" /data/local/tmp/e
 if errorlevel 1 goto :push_fail
 adb shell "chmod 755 /data/local/tmp/e"
 for %%F in (chain_hook.sh kernelsu.ko ksud magiskpolicy ksu_rules load_ko kmsg_dumper fne_syms.txt) do (

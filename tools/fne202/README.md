@@ -47,3 +47,7 @@ wrong slot is an arbitrary kernel write to the wrong address.
 - `patch_table.py` output for the 8.0.0.202 entry is byte-identical to the
   binary that was validated on hardware:
   `sha256 fa1f494ead1000d59a8f5c44714da7cf64c422b0d1d26313977f51e0668976c5`.
+  That exact build is committed as `root/exploit/ghostlock.fne202`, and
+  `run_root.bat` picks it automatically when `adb shell uname -r` matches
+  `gc5b795a0f72f`; regenerate it with the command above after any change to
+  the entry.
