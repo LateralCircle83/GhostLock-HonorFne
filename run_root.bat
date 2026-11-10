@@ -24,12 +24,9 @@ goto :deploy
 
 :undo
 where adb >nul 2>nul || goto :no_adb
+call :prepend_adb
 set "BASH="
-if exist "C:\Program Files\Git\bin\bash.exe" set "BASH=C:\Program Files\Git\bin\bash.exe"
-if not defined BASH if exist "C:\Program Files (x86)\Git\bin\bash.exe" set "BASH=C:\Program Files (x86)\Git\bin\bash.exe"
-if not defined BASH (
-    where bash >nul 2>nul && set "BASH=bash"
-)
+call :resolve_bash
 if not defined BASH goto :no_bash
 "%BASH%" "root/host-scripts/uninstall.sh"
 echo.
@@ -41,14 +38,12 @@ rem ---------- 1/5 Dependency check ----------
 echo [1/5] Checking dependencies...
 where adb >nul 2>nul
 if errorlevel 1 goto :no_adb
+call :prepend_adb
 set "BASH="
-if exist "C:\Program Files\Git\bin\bash.exe" set "BASH=C:\Program Files\Git\bin\bash.exe"
-if not defined BASH if exist "C:\Program Files (x86)\Git\bin\bash.exe" set "BASH=C:\Program Files (x86)\Git\bin\bash.exe"
-if not defined BASH (
-    where bash >nul 2>nul && set "BASH=bash"
-)
+call :resolve_bash
 if not defined BASH goto :no_bash
-echo       OK: adb and Git Bash are ready
+echo       OK: adb  = %GHOSTLOCK_ADB_DIR%\adb.exe
+echo       OK: bash = %BASH%
 echo.
 
 rem ---------- 2/5 Connect device ----------
@@ -140,6 +135,15 @@ echo.
 
 :grind
 rem ---------- 5/5 Run ----------
+rem Preflight: run_w2.sh calls bare `adb` inside bash. If the bash we picked
+rem cannot see adb (WSL's System32\bash.exe, or platform-tools missing from
+rem PATH) every call fails with rc=127, settle() burns ~10 minutes of silent
+rem retries, W1 "fails" in milliseconds, and run_forever.sh relaunches it
+rem forever -- which looks exactly like a hang/timeout. Fail loudly here.
+"%BASH%" -c "command -v adb >/dev/null 2>&1"
+if errorlevel 1 goto :no_adb_in_bash
+"%BASH%" -c "command -v timeout >/dev/null 2>&1"
+if errorlevel 1 echo       * WARN: GNU timeout not visible in bash - watchdogs disabled
 echo [5/5] Starting per-boot root (W1 - W2 - KSU late-load)
 echo       * Fully automatic, includes multiple device reboots, may take a long time
 echo       * Do not close this window; do not run other grinds simultaneously
@@ -186,7 +190,20 @@ exit /b 1
 
 :no_bash
 echo [ERROR] Git Bash not found.
-echo         Please install Git for Windows (https://git-scm.com/download/win).
+echo         NOTE: C:\Windows\System32\bash.exe is WSL, NOT Git Bash - this tool
+echo               cannot run under WSL (the scripts call Windows adb.exe).
+echo         Install Git for Windows (https://git-scm.com/download/win) anywhere you
+echo         like, or point GHOSTLOCK_BASH at an existing bash.exe, e.g.
+echo             set GHOSTLOCK_BASH=D:\Git\bin\bash.exe
+timeout /t 30 /nobreak >nul
+pause
+exit /b 1
+
+:no_adb_in_bash
+echo [ERROR] adb is not visible inside bash.
+echo         cmd found: %GHOSTLOCK_ADB_DIR%\adb.exe
+echo         but "%BASH%" cannot resolve `adb` - every adb call would fail rc=127.
+echo         Make sure the platform-tools directory is on PATH, then rerun.
 timeout /t 30 /nobreak >nul
 pause
 exit /b 1
@@ -233,5 +250,49 @@ adb shell "su 0 sh -c '[ -f /data/adb/modules/netfix_packet/sepolicy.rule ]'" >n
 ) || (
     echo       [WARN] netfix_packet module sync failed
 )
+goto :eof
+
+rem ==================== helpers ====================
+rem :resolve_bash  - set BASH to a Git for Windows bash.exe, or leave it unset.
+rem   Git Bash is REQUIRED: every host script is POSIX shell that calls the
+rem   Windows adb.exe and relies on MSYS path/adb.exe translation. WSL's bash
+rem   (C:\Windows\System32\bash.exe) has no adb on PATH -> rc=127 on every
+rem   call, which previously turned into a silent infinite grind.
+:resolve_bash
+set "BASH="
+rem 1) explicit override
+if defined GHOSTLOCK_BASH if exist "%GHOSTLOCK_BASH%" set "BASH=%GHOSTLOCK_BASH%"
+if defined BASH goto :eof
+rem 2) standard install locations (Program Files / per-user / common D:\ form)
+for %%P in (
+    "%ProgramFiles%\Git\bin\bash.exe"
+    "%ProgramW6432%\Git\bin\bash.exe"
+    "%LocalAppData%\Programs\Git\bin\bash.exe"
+    "D:\Git\bin\bash.exe"
+    "C:\Git\bin\bash.exe"
+) do if not defined BASH if exist "%%~P" set "BASH=%%~P"
+if defined BASH goto :eof
+rem 3) derive from git.exe on PATH: <Git>\cmd\git.exe -> <Git>\bin\bash.exe
+for /f "delims=" %%G in ('where git.exe 2^>nul') do (
+    if not defined BASH (
+        for %%H in ("%%~dpG..\bin\bash.exe") do if exist "%%~fH" set "BASH=%%~fH"
+    )
+)
+if defined BASH goto :eof
+rem 4) any non-WSL bash on PATH (MSYS2 / scoop / custom)
+for /f "delims=" %%B in ('where bash.exe 2^>nul') do (
+    if not defined BASH if /i not "%%~dpB"=="%SystemRoot%\System32\" set "BASH=%%~B"
+)
+goto :eof
+
+rem :prepend_adb  - put the real adb directory at the FRONT of PATH so the bash
+rem   child resolves the exact adb.exe cmd just used (usually
+rem   D:\MiniApp\platform-tools). Harmless when adb is not found.
+:prepend_adb
+set "GHOSTLOCK_ADB_DIR="
+for /f "delims=" %%A in ('where adb.exe 2^>nul') do if not defined GHOSTLOCK_ADB_DIR set "GHOSTLOCK_ADB_DIR=%%~dpA"
+if not defined GHOSTLOCK_ADB_DIR goto :eof
+set "GHOSTLOCK_ADB_DIR=%GHOSTLOCK_ADB_DIR:~0,-1%"
+set "PATH=%GHOSTLOCK_ADB_DIR%;%PATH%"
 goto :eof
 

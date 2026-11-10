@@ -43,8 +43,14 @@ while true; do
     drain
     sleep 1
   done
-  wait "$RPID" 2>/dev/null
+  wait "$RPID" 2>/dev/null; RC=$?
   drain
+  # 127 = run_w2.sh 顶部"bash 里没有 adb"的快速失败。继续重启只会无限空转，
+  # 直接把原因摆到屏幕/日志上再停。
+  if [ "$RC" = "127" ]; then
+    echo "=== OUTER LOOP: FATAL rc=127 (adb not found in this bash) - stopping ===" | tee -a "$LOG"
+    break
+  fi
 
   # 用 grep -E（ERE）而非 "a\|b"：\| 是 GNU/BSD 的 BRE 扩展，toybox/busybox
   # 的 grep 不认（实测返回 1），会让成功判定永远不命中。

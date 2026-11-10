@@ -12,6 +12,20 @@
 T30=""; T600=""
 command -v timeout >/dev/null 2>&1 && { T30="timeout 30"; T600="timeout 600"; }
 
+# 硬闸门：bash 里看不到 adb 时（典型原因 = run_root.bat 误用了 WSL 的
+# C:\Windows\System32\bash.exe，或 platform-tools 不在 PATH），下面每处 adb
+# 调用都会 rc=127；settle() 会静默烧掉约 10 分钟，W1 毫秒级"失败"，再由
+# run_forever.sh 无限重启 —— 表现就是"卡在 [5/5] 然后超时"。这里立刻停，
+# 让 run_forever.sh 看到 127 后停机。
+if ! command -v adb >/dev/null 2>&1; then
+  echo "FATAL: 'adb' not found on PATH inside this bash."
+  echo "       bash   = $(command -v bash || echo bash)"
+  echo "       PATH   = $PATH"
+  echo "       Fix: run run_root.bat (it prepends the platform-tools directory to"
+  echo "       PATH and refuses WSL bash), or use Git Bash with platform-tools on PATH."
+  exit 127
+fi
+
 # KSU 检测: 最多 2 次, 间隔 5s, 任一次命中即本 boot 已加载 —— 抗 adb 单次
 # 瞬断(空响应)的假阴性, 否则会误跑 exploit 触发 slab_drain 保护性重启。
 # 与 run_root.command / run_root.bat / uninstall.sh 同规则。
