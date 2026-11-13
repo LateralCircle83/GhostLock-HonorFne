@@ -17,3 +17,6 @@ root/host-scripts/*.log
 root/host-scripts/w1_try*.log
 grind_*.log
 
+# 本地调试产物 / 二进制备份
+root/exploit/*.bak
+root/host-scripts/*.log.tmp

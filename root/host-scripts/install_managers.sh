@@ -22,15 +22,30 @@ esac
 DEPLOY=deploy
 
 # --- 1. KernelSU 管理器 APK ---
-if $T30 adb shell pm list packages 2>/dev/null | tr -d '\r' | grep -q me.weishu.kernelsu; then
+# 2026-11-12 真机教训（FNE-AN00 8.0.0.202）：
+#   * shell 域的 `pm list packages` 会抛
+#     `SecurityException: Shell does not have permission to access user 100`，
+#     旧代码把「读不到」误判成「没装」，于是去 adb install -r；而 `adb install`
+#     是被中断过的 push-install 会话，会把包留在 frozen 状态，随后
+#     system_server 因 `Package ... is currently frozen!` 崩掉（整机 UI 假死）。
+#   * ⇒ 检测一律走 root；已装就**绝不重装**；只有真缺时才用
+#     `su -c pm install`（不用 adb install，失败也不会冻结包）。
+pkg_installed() {
+    $T30 adb shell "su -c pm list packages" 2>/dev/null | tr -d '\r' | grep -qx "package:me.weishu.kernelsu" && return 0
+    $T30 adb shell "su -c 'dumpsys package me.weishu.kernelsu'" 2>/dev/null | tr -d '\r' | grep -q versionName && return 0
+    return 1
+}
+if pkg_installed; then
     echo "      KernelSU 管理器已安装，跳过"
 else
-    echo "      安装 KernelSU 管理器 ..."
-    if $T180 adb install -r "$DEPLOY/KernelSU-manager.apk" >/dev/null 2>&1; then
+    echo "      安装 KernelSU 管理器（su -c pm install，不用 adb install）..."
+    $T30 adb push "$DEPLOY/KernelSU-manager.apk" /data/local/tmp/KernelSU-manager.apk >/dev/null 2>&1
+    if $T180 adb shell "su -c 'pm install -r -t /data/local/tmp/KernelSU-manager.apk'" 2>&1 | tr -d '\r' | grep -qi success; then
         echo "      KernelSU 管理器安装成功"
     else
-        echo "      [警告] KernelSU 管理器安装失败"
+        echo "      [警告] KernelSU 管理器安装失败（已装的话请检查是否处于 frozen 状态）"
     fi
+    $T30 adb shell "rm -f /data/local/tmp/KernelSU-manager.apk" >/dev/null 2>&1
 fi
 
 # --- 2. KSU 模块（ksud 官方安装） ---
